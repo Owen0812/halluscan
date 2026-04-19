@@ -205,7 +205,7 @@ HalluScan 用 Multi-Agent 架构解决这些问题：确定性词库扫描 + LLM
 | 安全层 | Guardian Agent | 基于 LLM 的提示词注入检测 |
 | 可观测性 | Langfuse Cloud | 全链路追踪，v4 接口 |
 | 后端 | FastAPI + SSE | 流式推送各节点进度，CORS 支持前端跨域 |
-| 前端 | Next.js 14 + TypeScript + Tailwind CSS | SSE 消费，实时更新 Agent 状态 |
+| 前端 | Next.js 14 + TypeScript + Tailwind CSS | SSE 消费，实时更新 Agent 状态；左侧栏支持扫描历史记录（最多 30 条） |
 
 ---
 
@@ -236,15 +236,15 @@ halluscan/
 │   └── src/
 │       ├── app/
 │       │   ├── layout.tsx          # 根布局
-│       │   └── page.tsx            # 主页（Input + Timeline + Report 三栏布局）
+│       │   └── page.tsx            # 主页（左侧扫描历史栏 + 右侧结果区 + 底部输入栏）
 │       ├── components/
-│       │   ├── ScanInput.tsx       # 文案输入框 + 提交按钮
-│       │   ├── AgentCard.tsx       # 单个 Agent 状态卡片（等待/运行中/完成）
+│       │   ├── ScanInput.tsx       # 文案输入框 + 提交按钮（Ctrl+Enter 快捷键）
+│       │   ├── AgentCard.tsx       # 单个 Agent 状态卡片（等待/运行中/完成，SVG 图标）
 │       │   ├── AgentTimeline.tsx   # 多 Agent 并行执行时间线
 │       │   └── VerdictReport.tsx   # 结构化合规报告 + 修复版本展示
 │       └── lib/
 │           ├── api.ts              # SSE 客户端，消费后端流式推送
-│           └── store.tsx           # Zustand 全局状态（phase / agentNodes / report）
+│           └── store.tsx           # React Context 全局状态（phase / nodes / history / report）
 │
 └── eval/
     ├── dataset.json                # 100 条标注样本（50 违规 + 50 合规）
@@ -389,11 +389,15 @@ Content-Type: application/json
 }
 ```
 
-### GET /scan/stream — SSE 流式审核
+### POST /scan/stream — SSE 流式审核
 
 ```
-GET http://localhost:8000/scan/stream?text=...
-Accept: text/event-stream
+POST http://localhost:8000/scan/stream
+Content-Type: application/json
+
+{
+  "text": "本品采用纳米技术，7天美白..."
+}
 ```
 
 推送事件序列：
