@@ -1,0 +1,23 @@
+# Agent 框架
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-community>=0.3.0
+
+# LLM - 阿里百炼 Qwen（通过 OpenAI 兼容接口调用）
+langchain-openai
+
+# 搜索工具
+tavily-python
+
+# Web 框架
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.0
+
+# 数据库（Phase 3）
+psycopg2-binary
+pgvector
+
+# 工具库
+pydantic>=2.0.0
+httpx
