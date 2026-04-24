@@ -123,16 +123,19 @@ export default function AgentCard({ node }: { node: AgentNode }) {
   const { phase } = useAppStore();
   const label    = node.label || node.node;
   const isDone   = node.status === "done";
+  const isError  = node.status === "error";
   const isWait   = node.status === "pending";
-  const isActive = isWait && phase === "scanning";
+  const isActive = node.status === "running" && phase === "scanning";
 
   return (
     <div
       className="flex items-center gap-3 px-3 py-2.5 transition-all duration-300"
       style={{
-        background: isDone ? "rgba(15,139,141,0.05)" : isActive ? "rgba(15,139,141,0.03)" : "rgba(0,0,0,0.015)",
+        background: isDone ? "rgba(15,139,141,0.05)" : isError ? "var(--ember-dim)" : isActive ? "rgba(15,139,141,0.03)" : "rgba(0,0,0,0.015)",
         border: isDone
           ? "1px solid var(--teal-border)"
+          : isError
+          ? "1px solid var(--ember-border)"
           : isActive
           ? "1px solid rgba(15,139,141,0.35)"
           : "1px dashed var(--border)",
@@ -145,9 +148,9 @@ export default function AgentCard({ node }: { node: AgentNode }) {
       <div
         className="w-6 h-6 rounded-md flex items-center justify-center shrink-0"
         style={{
-          background: isDone || isActive ? "var(--teal-dim)" : "rgba(0,0,0,0.04)",
-          border: `1px solid ${isDone || isActive ? "var(--teal-border)" : "var(--border)"}`,
-          color: isDone || isActive ? "var(--teal)" : "var(--text-3)",
+          background: isError ? "var(--ember-dim)" : isDone || isActive ? "var(--teal-dim)" : "rgba(0,0,0,0.04)",
+          border: `1px solid ${isError ? "var(--ember-border)" : isDone || isActive ? "var(--teal-border)" : "var(--border)"}`,
+          color: isError ? "var(--ember)" : isDone || isActive ? "var(--teal)" : "var(--text-3)",
         }}
       >
         <NodeIcon name={node.node} />
@@ -157,7 +160,7 @@ export default function AgentCard({ node }: { node: AgentNode }) {
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-xs font-medium truncate"
-                style={{ color: isDone || isActive ? "var(--text)" : "var(--text-3)" }}>
+                style={{ color: isDone || isActive || isError ? "var(--text)" : "var(--text-3)" }}>
             {label}
           </span>
           {isActive && (
@@ -168,6 +171,13 @@ export default function AgentCard({ node }: { node: AgentNode }) {
             <svg className="shrink-0" width="11" height="11" viewBox="0 0 24 24" fill="none"
                  stroke="var(--green)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="20 6 9 17 4 12" />
+            </svg>
+          )}
+          {isError && (
+            <svg className="shrink-0" width="11" height="11" viewBox="0 0 24 24" fill="none"
+                 stroke="var(--ember)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
             </svg>
           )}
         </div>

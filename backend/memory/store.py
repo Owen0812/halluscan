@@ -1,65 +1,76 @@
-"""
-记忆系统核心模块：pgvector 语义检索 + BM25 全文检索 + RRF 排名融合。
-
-无 DATABASE_URL 时所有函数静默返回空值，不影响主流程。
-"""
-
 import os
-import json
+
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import SimpleConnectionPool
 
-_conn = None
+_pool: SimpleConnectionPool | None = None
 _emb_model = None
 
 
-def _get_conn():
-    global _conn
+def _get_pool() -> SimpleConnectionPool | None:
+    global _pool
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         return None
+    if _pool is None:
+        minconn = int(os.getenv("HALLUSCAN_DB_POOL_MIN", "1"))
+        maxconn = int(os.getenv("HALLUSCAN_DB_POOL_MAX", "5"))
+        try:
+            _pool = SimpleConnectionPool(minconn, maxconn, db_url)
+        except Exception as exc:
+            print(f"[Memory] DB pool init failed: {exc}")
+            return None
+    return _pool
+
+
+def _borrow_conn():
+    pool = _get_pool()
+    if pool is None:
+        return None
     try:
-        if _conn is None or _conn.closed:
-            _conn = psycopg2.connect(db_url)
-            _conn.autocommit = True
-        return _conn
-    except Exception as e:
-        print(f"[Memory] DB connection failed: {e}")
+        conn = pool.getconn()
+        conn.autocommit = True
+        return conn
+    except Exception as exc:
+        print(f"[Memory] DB connection failed: {exc}")
         return None
 
 
+def _return_conn(conn) -> None:
+    pool = _get_pool()
+    if pool is not None and conn is not None:
+        pool.putconn(conn)
+
+
 def _get_emb():
-    """懒加载 DashScope text-embedding-v3（通过 OpenAI 兼容接口）。"""
     global _emb_model
     if _emb_model is None:
         from langchain_openai import OpenAIEmbeddings
+
         _emb_model = OpenAIEmbeddings(
-            model="text-embedding-v3",
+            model=os.getenv("HALLUSCAN_EMBEDDING_MODEL", "text-embedding-v3"),
             openai_api_key=os.getenv("DASHSCOPE_API_KEY", ""),
-            openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-            # DashScope 只接受字符串，禁用 langchain 默认的 token 分片行为
+            openai_api_base=os.getenv(
+                "HALLUSCAN_OPENAI_BASE_URL",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
             check_embedding_ctx_length=False,
         )
     return _emb_model
 
 
 def _vec_to_literal(vector: list) -> str:
-    """把 Python list 转成 pgvector 接受的字符串格式 '[0.1,0.2,...]'。"""
     return "[" + ",".join(str(v) for v in vector) + "]"
 
 
 def init_db():
-    """
-    建表并创建索引，服务启动时调用一次。
-    自动检测 embedding 维度，无需硬编码。
-    """
-    conn = _get_conn()
+    conn = _borrow_conn()
     if not conn:
         print("[Memory] No DATABASE_URL, memory system disabled")
         return
 
     try:
-        # 通过试调用确定实际 embedding 维度
         test_vec = _get_emb().embed_query("test")
         dim = len(test_vec)
         print(f"[Memory] Embedding dim = {dim}")
@@ -77,10 +88,15 @@ def init_db():
                     key_issues    TEXT[] DEFAULT '{{}}',
                     original_text TEXT DEFAULT '',
                     embedding     VECTOR({dim}),
-                    search_text   TSVECTOR
+                    search_text   TSVECTOR,
+                    dedupe_key    TEXT UNIQUE
                 )
             """)
-            # ivfflat 索引（lists=10 适合小数据集，生产环境按数据量调大）
+            cur.execute("ALTER TABLE audit_memories ADD COLUMN IF NOT EXISTS dedupe_key TEXT")
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS mem_dedupe_key_idx
+                ON audit_memories (dedupe_key)
+            """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS mem_embedding_idx
                 ON audit_memories USING ivfflat (embedding vector_cosine_ops)
@@ -91,22 +107,21 @@ def init_db():
                 ON audit_memories USING GIN (search_text)
             """)
         print("[Memory] DB initialized")
-    except Exception as e:
-        print(f"[Memory] DB init error: {e}")
+    except Exception as exc:
+        print(f"[Memory] DB init error: {exc}")
+    finally:
+        _return_conn(conn)
 
 
 def save_memory(state: dict) -> bool:
-    """
-    将一次完整审核结果蒸馏为结构化记忆对象存入数据库。
-    只在 verdict 存在时写入，合规/违规/存疑均保存（全量学习）。
-    """
-    conn = _get_conn()
+    conn = _borrow_conn()
     if not conn:
         return False
 
     verdict = state.get("verdict") or {}
     verdict_text = verdict.get("verdict", "")
     if not verdict_text:
+        _return_conn(conn)
         return False
 
     industry = state.get("content_type", "其他")
@@ -114,10 +129,8 @@ def save_memory(state: dict) -> bool:
     law_refs = verdict.get("law_references") or []
     key_issues = verdict.get("key_issues") or []
     original_text = (state.get("text") or "")[:500]
-
-    # 构建用于 embedding 和 BM25 检索的文本
-    # 使用结构化字段而非原始文案，保证跨案例的语义一致性
     mem_text = f"{industry} {verdict_text} {pattern} {' '.join(key_issues)}"
+    dedupe_key = f"{industry}|{verdict_text}|{pattern[:120]}"
 
     try:
         vector = _get_emb().embed_query(mem_text)
@@ -127,30 +140,26 @@ def save_memory(state: dict) -> bool:
             cur.execute("""
                 INSERT INTO audit_memories
                     (industry, pattern, verdict, law_refs, key_issues,
-                     original_text, embedding, search_text)
+                     original_text, embedding, search_text, dedupe_key)
                 VALUES (%s, %s, %s, %s, %s, %s, %s::vector,
-                        to_tsvector('simple', %s))
+                        to_tsvector('simple', %s), %s)
+                ON CONFLICT (dedupe_key) DO NOTHING
             """, (
                 industry, pattern, verdict_text,
                 law_refs, key_issues, original_text,
-                vec_literal, mem_text,
+                vec_literal, mem_text, dedupe_key,
             ))
-        print(f"[Memory] Saved: [{verdict_text}] {industry} – {pattern[:40]}")
+        print(f"[Memory] Saved: [{verdict_text}] {industry} - {pattern[:40]}")
         return True
-    except Exception as e:
-        print(f"[Memory] save failed: {e}")
+    except Exception as exc:
+        print(f"[Memory] save failed: {exc}")
         return False
+    finally:
+        _return_conn(conn)
 
 
 def retrieve_memories(text: str, top_k: int = 3) -> list:
-    """
-    混合检索历史案例：
-      - pgvector  余弦相似度（语义层）Top-20
-      - tsvector  BM25 关键词匹配（词法层）Top-20
-      - RRF       Reciprocal Rank Fusion 融合，k=60
-    返回 top_k 条最相关的历史案例，无结果或 DB 未配置时返回 []。
-    """
-    conn = _get_conn()
+    conn = _borrow_conn()
     if not conn:
         return []
 
@@ -162,7 +171,7 @@ def retrieve_memories(text: str, top_k: int = 3) -> list:
 
         vector = _get_emb().embed_query(text[:500])
         vec_literal = _vec_to_literal(vector)
-        RRF_K = 60
+        rrf_k = int(os.getenv("HALLUSCAN_RRF_K", "60"))
 
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
@@ -200,10 +209,12 @@ def retrieve_memories(text: str, top_k: int = 3) -> list:
                 JOIN audit_memories m ON m.id = r.id
                 ORDER BY r.rrf_score DESC
                 LIMIT %s
-            """, (vec_literal, text[:200], RRF_K, RRF_K, top_k))
+            """, (vec_literal, text[:200], rrf_k, rrf_k, top_k))
 
             return [dict(r) for r in cur.fetchall()]
 
-    except Exception as e:
-        print(f"[Memory] retrieve failed: {e}")
+    except Exception as exc:
+        print(f"[Memory] retrieve failed: {exc}")
         return []
+    finally:
+        _return_conn(conn)

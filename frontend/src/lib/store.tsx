@@ -1,9 +1,9 @@
 "use client";
 
-import React, { createContext, useContext, useState, useCallback } from "react";
-import { streamScan, SseEvent } from "./api";
+import React, { createContext, useContext, useState, useCallback, useRef } from "react";
+import { streamScan, SseEvent, StreamHandle } from "./api";
 
-export type NodeStatus = "pending" | "running" | "done";
+export type NodeStatus = "pending" | "running" | "done" | "error";
 
 export interface AgentNode {
   node: string;
@@ -79,8 +79,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [errorMsg, setErrorMsg] = useState("");
   const [history, setHistory] = useState<ScanRecord[]>([]);
   const [activeHistoryId, setActiveHistoryId] = useState<string | null>(null);
+  const scanHandleRef = useRef<StreamHandle | null>(null);
 
   const reset = useCallback(() => {
+    scanHandleRef.current?.abort();
+    scanHandleRef.current = null;
     setPhase("idle");
     setNodes([]);
     setVerdict(null);
@@ -124,6 +127,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const startScan = useCallback(() => {
     if (!inputText.trim()) return;
 
+    scanHandleRef.current?.abort();
     const capturedInput = inputText;
     const scanId = Date.now().toString();
 
@@ -141,9 +145,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     let localVerdict: VerdictData | null = null;
     let localFix: FixData | null = null;
 
-    streamScan(capturedInput, {
+    scanHandleRef.current = streamScan(capturedInput, {
       onEvent(e: SseEvent) {
         if (e.event === "start") return;
+
+        if (e.event === "node_start") {
+          const { node, label, desc } = e;
+          localNodes = localNodes.map((n) =>
+            n.node === node ? { ...n, label, desc, status: "running", data: {} } : n
+          );
+          setNodes([...localNodes]);
+          return;
+        }
 
         if (e.event === "node_complete") {
           const { node, label, desc, data } = e;
@@ -174,6 +187,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           const reason = e.reason;
           setBlockedReason(reason);
           setPhase("blocked");
+          scanHandleRef.current = null;
           const record: ScanRecord = {
             id: scanId, timestamp: parseInt(scanId),
             inputText: capturedInput, phase: "blocked",
@@ -186,6 +200,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
         if (e.event === "done") {
           setPhase("done");
+          scanHandleRef.current = null;
           const record: ScanRecord = {
             id: scanId, timestamp: parseInt(scanId),
             inputText: capturedInput, phase: "done",
@@ -193,11 +208,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           };
           setHistory((prev) => [record, ...prev].slice(0, 30));
           setActiveHistoryId(scanId);
+          return;
+        }
+
+        if (e.event === "error") {
+          const message = e.message || "审核流程异常，请稍后重试";
+          setErrorMsg(message);
+          setPhase("error");
+          scanHandleRef.current = null;
+          localNodes = localNodes.map((n) =>
+            n.status === "running" ? { ...n, status: "error" as NodeStatus } : n
+          );
+          setNodes([...localNodes]);
         }
       },
       onError(err) {
         setErrorMsg(err.message);
         setPhase("error");
+        scanHandleRef.current = null;
+        localNodes = localNodes.map((n) =>
+          n.status === "running" ? { ...n, status: "error" as NodeStatus } : n
+        );
+        setNodes([...localNodes]);
       },
     });
   }, [inputText, reset]);
